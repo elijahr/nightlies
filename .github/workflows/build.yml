@@ -1,0 +1,216 @@
+name: Build Nim release binaries (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      source_repo:
+        description: 'owner/repo of the Nim source to build'
+        type: string
+        required: false
+        default: 'nim-lang/Nim'
+      ref:
+        description: 'Git ref/sha of source_repo to build (the tagged commit)'
+        type: string
+        required: true
+      matrix_subset:
+        description: 'JSON array of triples to build; empty = all 8'
+        type: string
+        required: false
+        default: ''
+    outputs:
+      commit:
+        description: 'Resolved full commit sha that was built'
+        value: ${{ jobs.setup.outputs.commit }}
+      source_artifact:
+        description: 'Artifact name holding the source tarball (nim-<commit>)'
+        value: ${{ jobs.setup.outputs.source_artifact }}
+      environment:
+        description: 'JSON env map ({ SOURCE_CODE_EPOCH }) threaded to sourceArchive + build (baseline parity, F10)'
+        value: ${{ jobs.setup.outputs.environment }}
+    secrets:
+      token:
+        description: 'Token for deps.sh downloads + checkout; defaults to caller GITHUB_TOKEN'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-22.04
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      source_artifact: nim-${{ steps.resolve.outputs.commit }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      environment: ${{ steps.resolve.outputs.environment }}
+    steps:
+      - name: Resolve commit
+        id: resolve
+        shell: bash
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          # M1: caller passes a tag-push github.sha (already a 40-char SHA),
+          # so use inputs.ref directly as the commit with no rev-parse round-trip.
+          commit="$REF"
+          if ! printf '%s' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::inputs.ref must be a full 40-char commit sha, got '$commit'"
+            exit 1
+          fi
+          # F10: baseline-parity SOURCE_CODE_EPOCH (reproducible-build timestamp).
+          environment=$(jq -nc --arg e "$(date -u +%s)" '{ SOURCE_CODE_EPOCH: $e }')
+          echo "commit=$commit"           >> "$GITHUB_OUTPUT"
+          echo "environment=$environment" >> "$GITHUB_OUTPUT"
+      - name: Compute effective matrix
+        id: matrix
+        shell: bash
+        env:
+          SUBSET: ${{ inputs.matrix_subset }}
+        run: |
+          all='[
+            {"os":"linux",       "triple":"x86_64-linux-musl",       "builder":"ubuntu-22.04",     "mode":"cross"},
+            {"os":"linux",       "triple":"i686-linux-musl",         "builder":"ubuntu-22.04",     "mode":"cross"},
+            {"os":"linux_arm64", "triple":"aarch64-linux-musl",      "builder":"ubuntu-22.04-arm", "mode":"native"},
+            {"os":"linux",       "triple":"armv7l-linux-musleabihf", "builder":"ubuntu-22.04",     "mode":"cross"},
+            {"os":"macosx",      "triple":"x86_64-apple-darwin14",   "builder":"macos-15-intel",   "mode":"native"},
+            {"os":"macosx_arm64","triple":"arm64-apple-darwin24.2.0","builder":"macos-15",         "mode":"native"},
+            {"os":"windows",     "triple":"x86_64-w64-mingw32",      "builder":"windows-2025",     "mode":"native"},
+            {"os":"windows",     "triple":"i686-w64-mingw32",        "builder":"windows-2025",     "mode":"native"}
+          ]'
+          subset="${SUBSET:-}"
+          if [ -z "$subset" ] || [ "$subset" = "[]" ]; then
+            out=$(jq -c '.' <<<"$all")
+          else
+            out=$(jq -c --argjson sub "$subset" '[ .[] | select(.triple as $t | $sub | index($t)) ]' <<<"$all")
+          fi
+          echo "matrix=$out" >> "$GITHUB_OUTPUT"
+
+  sourceArchive:
+    needs: [ setup ]
+    runs-on: ubuntu-22.04
+    env: ${{ fromJson(needs.setup.outputs.environment) }}   # SOURCE_CODE_EPOCH (baseline parity, F10)
+    steps:
+      - name: Checkout Nim source @ tagged commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.ref }}
+          path: nim
+          fetch-depth: 0
+      - name: Get csources version
+        id: csources-version
+        shell: bash
+        run: |
+          csources_repo=nim-lang/csources_v2
+          csources_commit=$(git ls-remote "https://github.com/$csources_repo" master | cut -f 1)
+          if [[ -f nim/config/build_config.txt ]]; then
+            . nim/config/build_config.txt
+            csources_repo=${nim_csourcesUrl#https://github.com/}
+            csources_repo=${csources_repo%.git}
+            csources_commit=$nim_csourcesHash
+          fi
+          echo "repo=$csources_repo"     >> "$GITHUB_OUTPUT"
+          echo "commit=$csources_commit" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.csources-version.outputs.repo }}
+          ref: ${{ steps.csources-version.outputs.commit }}
+          path: csources
+      - name: Setup environment
+        shell: bash
+        run: echo '${{ github.workspace }}/nim/bin' >> "$GITHUB_PATH"
+      - name: Build 1-stage csources compiler
+        shell: bash
+        run: |
+          make -C csources -j "$(nproc)" CC=gcc
+          cp csources/bin/nim nim/bin
+      - name: Build compiler
+        shell: bash
+        working-directory: nim
+        run: |
+          nim c koch
+          ./koch boot -d:release
+      - name: Generate csources
+        shell: bash
+        working-directory: nim
+        run: ./koch csources -d:danger '-d:gitHash:${{ needs.setup.outputs.commit }}'
+      - name: Bundle external sources
+        shell: bash
+        working-directory: nim
+        run: |
+          version=$(nim secret --hints:off <<< 'echo NimVersion; quit 0')
+          major=${version%%.*}
+          minor=${version#*.}; minor=${minor%.*}
+          ./koch nimble
+          if [[ $major -ge 1 && $minor -ge 4 ]]; then ./koch fusion; fi
+      - name: Build source archive
+        shell: bash
+        working-directory: nim
+        run: |
+          ./koch xz
+          mkdir -p output
+          source=$(basename build/nim-*.tar.xz)
+          version=${source%.tar.xz}; version=${version#nim-}
+          cp "build/$source" "output/nim-$version.tar.xz"
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.setup.outputs.source_artifact }}   # nim-<commit>
+          path: nim/output/*                                  # baseline copies tarball into nim/output/ (NOT build/)
+          if-no-files-found: error
+
+  build:
+    needs: [ setup, sourceArchive ]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup.outputs.matrix) }}
+    env: ${{ fromJson(needs.setup.outputs.environment) }}   # SOURCE_CODE_EPOCH (baseline parity, F10)
+    runs-on: ${{ matrix.target.builder }}
+    steps:
+      - name: Checkout build scripts (this reusable repo)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: nightlies
+      - name: Install dependencies
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.token || github.token }}
+        run: nightlies/deps.sh -t '${{ matrix.target.triple }}'
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.setup.outputs.source_artifact }}
+          path: source
+      - name: Extract source package
+        id: source
+        shell: bash
+        run: |
+          source=( source/nim-*.tar.xz )
+          version=${source[0]##*nim-}
+          version=${version%%.tar.xz}
+          case '${{ runner.os }}' in
+            'Windows') 7z x -so "${source[0]}" | 7z x -si -ttar -aoa ;;
+            *) tar xJf "${source[0]}" ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Setup environment
+        shell: bash
+        run: echo "-d:gitHash:\"${{ needs.setup.outputs.commit }}\"" >> external/nim.cfg
+      - name: Build release binaries
+        shell: bash
+        run: nightlies/build-release.sh 'nim-${{ steps.source.outputs.version }}'
+      - name: Prepare binaries for upload
+        id: release
+        shell: bash
+        run: |
+          source nightlies/lib.sh
+          artifact=$(< output/nim.txt)
+          echo "artifact_nativepath=$(nativepath "$artifact")" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 'binaries-${{ matrix.target.triple }}'
+          path: '${{ steps.release.outputs.artifact_nativepath }}'
+          if-no-files-found: error
