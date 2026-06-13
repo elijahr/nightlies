@@ -199,6 +199,22 @@ jobs:
       - name: Setup environment
         shell: bash
         run: echo "-d:gitHash:\"${{ needs.setup.outputs.commit }}\"" >> external/nim.cfg
+      - name: Inject gitHash into in-tree config (Windows only)
+        # The external/nim.cfg injection above reaches the compiler via
+        # build-release.sh exporting XDG_CONFIG_HOME and copying nim.cfg to
+        # $XDG_CONFIG_HOME/nim/nim.cfg (nim's user config). getConfigDir()
+        # honors XDG_CONFIG_HOME only on non-Windows; on Windows it returns
+        # %APPDATA%, so that user-config path is never read and gitHash stays
+        # empty (banner compiled out via `when gitHash.len == 40`). The
+        # Windows release binary is produced by koch winrelease's own
+        # `koch boot` (koch.nim winReleaseArch), which reads the in-tree
+        # system/prefix config <prefixDir>/config/nim.cfg (getSystemConfigPath,
+        # always read regardless of --skipUserCfg) on every OS. Appending here
+        # makes the hash reach that boot on Windows. Scoped to Windows so the
+        # proven Linux/macOS XDG path is left byte-for-byte unchanged.
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "-d:gitHash:\"${{ needs.setup.outputs.commit }}\"" >> "nim-${{ steps.source.outputs.version }}/config/nim.cfg"
       - name: Build release binaries
         shell: bash
         run: nightlies/build-release.sh 'nim-${{ steps.source.outputs.version }}'
